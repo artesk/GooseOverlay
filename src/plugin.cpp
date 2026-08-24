@@ -36,6 +36,8 @@ struct ClientState {
     std::wstring name;
     bool talking{};
     bool whisper{};
+    bool muted{};
+    bool soundMuted{};
 };
 
 struct Config {
@@ -224,6 +226,15 @@ void refreshClients(uint64 server) {
         client.id = ids[i];
         client.name = utf8ToWide(nickname);
         g_ts3.freeMemory(nickname);
+        int inputMuted{};
+        if (g_ts3.getClientVariableAsInt(server, client.id, CLIENT_INPUT_MUTED, &inputMuted) == ERROR_ok) {
+            client.muted = inputMuted != 0;
+        }
+        int outputMuted{};
+        int outputOnlyMuted{};
+        const bool hasOutputMuted = g_ts3.getClientVariableAsInt(server, client.id, CLIENT_OUTPUT_MUTED, &outputMuted) == ERROR_ok;
+        const bool hasOutputOnlyMuted = g_ts3.getClientVariableAsInt(server, client.id, CLIENT_OUTPUTONLY_MUTED, &outputOnlyMuted) == ERROR_ok;
+        client.soundMuted = (hasOutputMuted && outputMuted != 0) || (hasOutputOnlyMuted && outputOnlyMuted != 0);
         {
             std::lock_guard<std::mutex> lock(g_modelMutex);
             const auto talk = g_talkState.find(client.id);
@@ -306,6 +317,48 @@ void drawTextLine(HDC dc, const std::wstring& text, RECT rect, COLORREF color, H
     SelectObject(dc, oldFont);
 }
 
+void drawMutedMicrophone(HDC dc, int x, int y) {
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(232, 83, 83));
+    const HGDIOBJ oldPen = SelectObject(dc, pen);
+    const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+    RoundRect(dc, x + 5, y + 1, x + 12, y + 12, 5, 5);
+    MoveToEx(dc, x + 8, y + 12, nullptr);
+    LineTo(dc, x + 8, y + 16);
+    MoveToEx(dc, x + 4, y + 16, nullptr);
+    LineTo(dc, x + 13, y + 16);
+    MoveToEx(dc, x + 2, y + 1, nullptr);
+    LineTo(dc, x + 15, y + 17);
+
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+void drawMutedSpeaker(HDC dc, int x, int y) {
+    const COLORREF speakerColor = RGB(239, 190, 70);
+    HPEN speakerPen = CreatePen(PS_SOLID, 1, speakerColor);
+    HBRUSH speakerBrush = CreateSolidBrush(speakerColor);
+    const HGDIOBJ oldPen = SelectObject(dc, speakerPen);
+    const HGDIOBJ oldBrush = SelectObject(dc, speakerBrush);
+    POINT speaker[] = {
+        {x + 2, y + 7}, {x + 6, y + 7}, {x + 11, y + 3},
+        {x + 11, y + 15}, {x + 6, y + 11}, {x + 2, y + 11},
+    };
+    Polygon(dc, speaker, static_cast<int>(std::size(speaker)));
+
+    HPEN slashPen = CreatePen(PS_SOLID, 2, RGB(232, 83, 83));
+    SelectObject(dc, slashPen);
+    MoveToEx(dc, x + 1, y + 2, nullptr);
+    LineTo(dc, x + 15, y + 17);
+
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(slashPen);
+    DeleteObject(speakerBrush);
+    DeleteObject(speakerPen);
+}
+
 void paintOverlay(HWND window) {
     PAINTSTRUCT paint{};
     HDC dc = BeginPaint(window, &paint);
@@ -344,7 +397,7 @@ void paintOverlay(HWND window) {
     HFONT headerFont = CreateFontW(-config.fontSize, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HFONT bodyFont = CreateFontW(-config.fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     RECT header{left + 16, top, panel.right - 12, top + 36};
-    drawTextLine(dc, L"TEAMSPEAK", header, RGB(229, 167, 43), headerFont, DT_LEFT | DT_END_ELLIPSIS);
+    drawTextLine(dc, L"GooseOverlay", header, RGB(229, 167, 43), headerFont, DT_LEFT | DT_END_ELLIPSIS);
 
     if (clients.empty()) {
         RECT row{left + 16, top + 36, panel.right - 12, top + 36 + config.rowHeight};
@@ -361,7 +414,17 @@ void paintOverlay(HWND window) {
             SelectObject(dc, oldPen);
             SelectObject(dc, oldBrush);
             DeleteObject(dotBrush);
-            RECT row{left + 36, y, panel.right - 12, y + config.rowHeight};
+            int textRight = panel.right - 12;
+            const int iconY = y + std::max(1, (config.rowHeight - 18) / 2);
+            if (client.soundMuted) {
+                drawMutedSpeaker(dc, textRight - 17, iconY);
+                textRight -= 23;
+            }
+            if (client.muted) {
+                drawMutedMicrophone(dc, textRight - 17, iconY);
+                textRight -= 23;
+            }
+            RECT row{left + 36, y, textRight, y + config.rowHeight};
             drawTextLine(dc, client.name, row, client.talking ? RGB(245, 247, 250) : RGB(190, 197, 207), bodyFont, DT_LEFT | DT_END_ELLIPSIS);
         }
     }
@@ -712,7 +775,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 }
 
 TS3_EXPORT const char* ts3plugin_name() { return "GooseOverlay"; }
-TS3_EXPORT const char* ts3plugin_version() { return "0.3.0"; }
+TS3_EXPORT const char* ts3plugin_version() { return "0.5.0"; }
 TS3_EXPORT int ts3plugin_apiVersion() { return kPluginApiVersion; }
 TS3_EXPORT const char* ts3plugin_author() { return "GooseOverlay contributors"; }
 TS3_EXPORT const char* ts3plugin_description() { return "TeamSpeak speaking overlay for Battles for Glory (borderless/windowed mode)."; }
@@ -831,6 +894,10 @@ TS3_EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 server, int status, 
 
 TS3_EXPORT void ts3plugin_onTalkStatusChangeEvent(uint64 server, int status, int isWhisper, anyID clientId) {
     updateTalkState(server, clientId, status != STATUS_NOT_TALKING, isWhisper != 0);
+}
+
+TS3_EXPORT void ts3plugin_onUpdateClientEvent(uint64 server, anyID, anyID, const char*, const char*) {
+    if (server == g_server.load()) refreshClients(server);
 }
 
 TS3_EXPORT void ts3plugin_onClientMoveEvent(uint64 server, anyID, uint64, uint64, int, const char*) {
