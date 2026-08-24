@@ -1,0 +1,16 @@
+[game]
+; Comma-separated executable names. Matching is case-insensitive.
+processes=BattlesForGlory.exe,Battles For Glory.exe,BFG.exe
+; Window-title fallback. Leave empty to disable title matching.
+title_contains=Battles for Glory
+hide_when_unfocused=1
+
+[overlay]
+enabled=1
+opacity=225
+width=310
+offset_x=24
+offset_y=72
+row_height=30
+font_size=17
+max_clients=16
