@@ -1,0 +1,4 @@
+#include "resources.h"
+
+IDR_LEADER_IDLE RCDATA "../assets/leader-idle.jpg"
+IDR_LEADER_SPEAKING RCDATA "../assets/leader-speaking.jpg"

@@ -1,11 +1,16 @@
 [game]
 ; Comma-separated executable names. Matching is case-insensitive.
-processes=BattlesForGlory.exe,Battles For Glory.exe,BFG.exe
+processes=BattlesForGlory.exe,Battles For Glory.exe,bsfg.exe
 ; Window-title fallback. Leave empty to disable title matching.
 title_contains=Battles for Glory
 hide_when_unfocused=1
 
 [overlay]
+clock_enabled=1
+; Windows time zone ID. Empty value follows the computer time zone.
+clock_timezone=Russian Standard Time
+leader_enabled=1
+leader_size=128
 enabled=1
 opacity=225
 width=310

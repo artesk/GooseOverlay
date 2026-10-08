@@ -1,0 +1,27 @@
+EXPORTS
+    ts3plugin_apiVersion
+    ts3plugin_author
+    ts3plugin_commandKeyword
+    ts3plugin_configure
+    ts3plugin_currentServerConnectionChanged
+    ts3plugin_description
+    ts3plugin_freeMemory
+    ts3plugin_init
+    ts3plugin_initHotkeys
+    ts3plugin_name
+    ts3plugin_offersConfigure
+    ts3plugin_onClientKickFromChannelEvent
+    ts3plugin_onClientKickFromServerEvent
+    ts3plugin_onClientMoveEvent
+    ts3plugin_onClientMoveMovedEvent
+    ts3plugin_onClientMoveSubscriptionEvent
+    ts3plugin_onClientMoveTimeoutEvent
+    ts3plugin_onConnectStatusChangeEvent
+    ts3plugin_onHotkeyEvent
+    ts3plugin_onTalkStatusChangeEvent
+    ts3plugin_onUpdateClientEvent
+    ts3plugin_processCommand
+    ts3plugin_registerPluginID
+    ts3plugin_setFunctionPointers
+    ts3plugin_shutdown
+    ts3plugin_version

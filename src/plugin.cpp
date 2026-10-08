@@ -5,6 +5,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <windowsx.h>
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,9 @@
 #include "teamspeak/public_definitions.h"
 #include "teamspeak/public_errors.h"
 #include "ts3_functions.h"
+#include "leader_portrait.h"
+#include "paint_buffer.h"
+#include "overlay_clock.h"
 
 namespace {
 
@@ -30,6 +34,10 @@ constexpr int kPluginApiVersion = 26;
 constexpr wchar_t kOverlayClass[] = L"GooseOverlayWindow";
 constexpr wchar_t kSettingsClass[] = L"GooseOverlaySettingsWindow";
 constexpr COLORREF kTransparentColor = RGB(1, 2, 3);
+constexpr UINT kMoveModeMessage = WM_APP + 1;
+constexpr UINT kPositionChangedMessage = WM_APP + 2;
+constexpr UINT kMoveStateChangedMessage = WM_APP + 3;
+constexpr int kMoveHintHeight = 40;
 
 struct ClientState {
     anyID id{};
@@ -41,6 +49,10 @@ struct ClientState {
 };
 
 struct Config {
+    OverlayClock clock;
+    std::wstring leaderName{L"восток"};
+    bool leaderEnabled{true};
+    int leaderSize{128};
     std::vector<std::wstring> processes;
     std::wstring titleContains;
     bool hideWhenUnfocused{true};
@@ -56,6 +68,8 @@ struct Config {
 TS3Functions g_ts3{};
 std::mutex g_modelMutex;
 std::vector<ClientState> g_clients;
+// Incoming whispers may originate outside the subscribed/current channel.
+std::unordered_map<anyID, ClientState> g_whisperClients;
 std::unordered_map<anyID, std::pair<bool, bool>> g_talkState;
 std::mutex g_configMutex;
 Config g_config;
@@ -67,6 +81,7 @@ std::atomic<HWND> g_overlayWindow{nullptr};
 std::atomic<HWND> g_gameWindow{nullptr};
 std::atomic<HWND> g_settingsWindow{nullptr};
 std::atomic<bool> g_settingsOpen{false};
+std::atomic<bool> g_moveMode{false};
 std::thread g_overlayThread;
 std::string g_pluginId;
 HINSTANCE g_module{};
@@ -87,6 +102,10 @@ std::wstring trim(std::wstring value) {
     value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
     return value;
 }
+
+// Created, accessed and destroyed exclusively on the overlay window thread.
+LeaderPortrait* g_leaderPortrait{};
+PaintBuffer* g_paintBuffer{};
 
 std::wstring lower(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), towlower);
@@ -138,16 +157,25 @@ void writeDefaultConfig() {
 void loadConfig() {
     writeDefaultConfig();
     wchar_t buffer[1024]{};
-    GetPrivateProfileStringW(L"game", L"processes", L"BattlesForGlory.exe,Battles For Glory.exe,BFG.exe", buffer, 1024, g_configPath.c_str());
+    GetPrivateProfileStringW(L"game", L"processes", L"BattlesForGlory.exe,Battles For Glory.exe,bsfg.exe", buffer, 1024, g_configPath.c_str());
     Config next;
     next.processes = splitProcesses(buffer);
+    const auto defaultLeader = encodeLeaderName(next.leaderName);
+    GetPrivateProfileStringW(L"overlay", L"leader_name", defaultLeader.c_str(), buffer, 1024, g_configPath.c_str());
+    next.leaderName = trim(decodeLeaderName(buffer));
+    if (next.leaderName.empty()) next.leaderName = L"восток";
+    next.leaderEnabled = readInt(L"overlay", L"leader_enabled", 1, 0, 1) != 0;
+    next.leaderSize = readInt(L"overlay", L"leader_size", 128, 64, 256);
+    next.clock.enabled = readInt(L"overlay", L"clock_enabled", 1, 0, 1) != 0;
+    GetPrivateProfileStringW(L"overlay", L"clock_timezone", L"Russian Standard Time", buffer, 1024, g_configPath.c_str());
+    setClockTimeZone(next.clock, buffer);
     GetPrivateProfileStringW(L"game", L"title_contains", L"Battles for Glory", buffer, 1024, g_configPath.c_str());
     next.titleContains = lower(trim(buffer));
     next.hideWhenUnfocused = readInt(L"game", L"hide_when_unfocused", 1, 0, 1) != 0;
     next.opacity = readInt(L"overlay", L"opacity", 225, 40, 255);
     next.width = readInt(L"overlay", L"width", 310, 180, 800);
-    next.offsetX = readInt(L"overlay", L"offset_x", 24, 0, 4000);
-    next.offsetY = readInt(L"overlay", L"offset_y", 72, 0, 4000);
+    next.offsetX = readInt(L"overlay", L"offset_x", 24, 0, 32767);
+    next.offsetY = readInt(L"overlay", L"offset_y", 72, 0, 32767);
     next.rowHeight = readInt(L"overlay", L"row_height", 30, 20, 80);
     next.fontSize = readInt(L"overlay", L"font_size", 17, 10, 44);
     next.maxClients = readInt(L"overlay", L"max_clients", 16, 1, 64);
@@ -160,7 +188,13 @@ void persistEnabled() {
     WritePrivateProfileStringW(L"overlay", L"enabled", g_enabled ? L"1" : L"0", g_configPath.c_str());
 }
 
-void saveConfig(const Config& config, bool enabled) {
+bool saveConfig(const Config& config, bool enabled) {
+    if (!WritePrivateProfileStringW(L"overlay", L"clock_enabled", config.clock.enabled ? L"1" : L"0", g_configPath.c_str()) ||
+        !WritePrivateProfileStringW(L"overlay", L"clock_timezone", config.clock.zoneId.c_str(), g_configPath.c_str())) return false;
+    if (!WritePrivateProfileStringW(L"overlay", L"leader_name",
+        encodeLeaderName(config.leaderName).c_str(), g_configPath.c_str())) return false;
+    if (!WritePrivateProfileStringW(L"overlay", L"leader_enabled", config.leaderEnabled ? L"1" : L"0", g_configPath.c_str()) ||
+        !WritePrivateProfileStringW(L"overlay", L"leader_size", std::to_wstring(config.leaderSize).c_str(), g_configPath.c_str())) return false;
     const std::wstring processes = joinProcesses(config.processes);
     WritePrivateProfileStringW(L"game", L"processes", processes.c_str(), g_configPath.c_str());
     WritePrivateProfileStringW(L"game", L"title_contains", config.titleContains.c_str(), g_configPath.c_str());
@@ -168,8 +202,8 @@ void saveConfig(const Config& config, bool enabled) {
     WritePrivateProfileStringW(L"overlay", L"enabled", enabled ? L"1" : L"0", g_configPath.c_str());
     WritePrivateProfileStringW(L"overlay", L"opacity", std::to_wstring(config.opacity).c_str(), g_configPath.c_str());
     WritePrivateProfileStringW(L"overlay", L"width", std::to_wstring(config.width).c_str(), g_configPath.c_str());
-    WritePrivateProfileStringW(L"overlay", L"offset_x", std::to_wstring(config.offsetX).c_str(), g_configPath.c_str());
-    WritePrivateProfileStringW(L"overlay", L"offset_y", std::to_wstring(config.offsetY).c_str(), g_configPath.c_str());
+    if (!WritePrivateProfileStringW(L"overlay", L"offset_x", std::to_wstring(config.offsetX).c_str(), g_configPath.c_str()) ||
+        !WritePrivateProfileStringW(L"overlay", L"offset_y", std::to_wstring(config.offsetY).c_str(), g_configPath.c_str())) return false;
     WritePrivateProfileStringW(L"overlay", L"row_height", std::to_wstring(config.rowHeight).c_str(), g_configPath.c_str());
     WritePrivateProfileStringW(L"overlay", L"font_size", std::to_wstring(config.fontSize).c_str(), g_configPath.c_str());
     WritePrivateProfileStringW(L"overlay", L"max_clients", std::to_wstring(config.maxClients).c_str(), g_configPath.c_str());
@@ -180,6 +214,7 @@ void saveConfig(const Config& config, bool enabled) {
     g_enabled = enabled;
     g_gameWindow = nullptr;
     invalidateOverlay();
+    return true;
 }
 
 void logMessage(const char* message, LogLevel level = LogLevel_INFO) {
@@ -198,6 +233,7 @@ void invalidateOverlay() {
 void clearClients() {
     std::lock_guard<std::mutex> lock(g_modelMutex);
     g_clients.clear();
+    g_whisperClients.clear();
     g_talkState.clear();
     invalidateOverlay();
 }
@@ -240,7 +276,7 @@ void refreshClients(uint64 server) {
             const auto talk = g_talkState.find(client.id);
             if (talk != g_talkState.end()) {
                 client.talking = talk->second.first;
-                client.whisper = talk->second.second;
+                client.whisper = client.talking && talk->second.second;
             }
         }
         next.push_back(std::move(client));
@@ -359,11 +395,82 @@ void drawMutedSpeaker(HDC dc, int x, int y) {
     DeleteObject(speakerPen);
 }
 
-void paintOverlay(HWND window) {
-    PAINTSTRUCT paint{};
-    HDC dc = BeginPaint(window, &paint);
-    RECT bounds{};
-    GetClientRect(window, &bounds);
+std::vector<ClientState> displayClients() {
+    std::lock_guard<std::mutex> lock(g_modelMutex);
+    auto clients = g_clients;
+    for (const auto& entry : g_whisperClients) {
+        const auto existing = std::find_if(clients.begin(), clients.end(), [&](const ClientState& client) {
+            return client.id == entry.first;
+        });
+        if (existing == clients.end()) clients.push_back(entry.second);
+        else {
+            existing->talking = true;
+            existing->whisper = true;
+        }
+    }
+    std::stable_sort(clients.begin(), clients.end(), [](const ClientState& a, const ClientState& b) {
+        if (a.whisper != b.whisper) return a.whisper > b.whisper;
+        return a.talking > b.talking;
+    });
+    return clients;
+}
+
+RECT overlayPanelRect(const RECT& bounds, const Config& config, size_t clientCount) {
+    const int rows = std::max(1, std::min(static_cast<int>(clientCount), config.maxClients));
+    const int width = std::min(config.width, static_cast<int>(bounds.right));
+    const int height = 36 + rows * config.rowHeight + 8 + kMoveHintHeight;
+    const int left = std::clamp(static_cast<int>(bounds.right) - config.offsetX - width,
+        0, std::max(0, static_cast<int>(bounds.right) - width));
+    const int top = std::clamp(config.offsetY, 0, std::max(0, static_cast<int>(bounds.bottom) - height));
+    return {left, top, left + width, top + height};
+}
+
+RECT largeLeaderPortraitRect(const RECT& bounds, const Config& config, size_t clientCount) {
+    const auto panel = overlayPanelRect(bounds, config, clientCount);
+    const int width = panel.right - panel.left;
+    const int top = panel.bottom + 8;
+    const int size = std::max(0, std::min({config.leaderSize, width,
+        static_cast<int>(bounds.bottom) - top}));
+    const int x = panel.left + (width - size) / 2;
+    return {x, top, x + size, top + size};
+}
+
+RECT overlayHeaderRect(const RECT& bounds, const Config& config) {
+    const auto panel = overlayPanelRect(bounds, config, displayClients().size());
+    return {panel.left + 16, panel.top, panel.right - 12, panel.top + 36};
+}
+
+void drawMoveHint(HDC dc, const RECT& panel, bool moving) {
+    const wchar_t* first = moving ? L"Отпустите ЛКМ — сохранить" : L"Ctrl+Alt+M";
+    const wchar_t* second = moving ? L"Esc / ПКМ — отмена" : L"Переместить панель";
+    const int available = std::max(1L, panel.right - panel.left - 28);
+    // Keep the instructions readable at the minimum supported panel width.
+    int fontSize = 13;
+    HFONT font{};
+    for (;;) {
+        font = CreateFontW(-fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        const auto oldFont = SelectObject(dc, font);
+        SIZE firstSize{}, secondSize{};
+        GetTextExtentPoint32W(dc, first, static_cast<int>(wcslen(first)), &firstSize);
+        GetTextExtentPoint32W(dc, second, static_cast<int>(wcslen(second)), &secondSize);
+        SelectObject(dc, oldFont);
+        if (std::max(firstSize.cx, secondSize.cx) <= available || fontSize <= 10) break;
+        DeleteObject(font);
+        --fontSize;
+    }
+    RECT separator{panel.left + 16, panel.bottom - kMoveHintHeight, panel.right - 12, panel.bottom - kMoveHintHeight + 1};
+    HBRUSH brush = CreateSolidBrush(RGB(46, 52, 62));
+    FillRect(dc, &separator, brush);
+    DeleteObject(brush);
+    RECT line{panel.left + 16, separator.bottom + 2, panel.right - 12, separator.bottom + 19};
+    drawTextLine(dc, first, line, moving ? RGB(239, 190, 70) : RGB(155, 165, 180), font, DT_LEFT | DT_END_ELLIPSIS);
+    OffsetRect(&line, 0, 17);
+    drawTextLine(dc, second, line, RGB(155, 165, 180), font, DT_LEFT | DT_END_ELLIPSIS);
+    DeleteObject(font);
+}
+
+void renderOverlay(HDC dc, RECT bounds, ULONGLONG tick, const SYSTEMTIME* utc = nullptr) {
     HBRUSH transparentBrush = CreateSolidBrush(kTransparentColor);
     FillRect(dc, &bounds, transparentBrush);
     DeleteObject(transparentBrush);
@@ -373,18 +480,13 @@ void paintOverlay(HWND window) {
         std::lock_guard<std::mutex> lock(g_configMutex);
         config = g_config;
     }
-    std::vector<ClientState> clients;
-    {
-        std::lock_guard<std::mutex> lock(g_modelMutex);
-        clients = g_clients;
-    }
+    const auto clients = displayClients();
 
     const int visibleCount = std::min<int>(static_cast<int>(clients.size()), config.maxClients);
-    const int rows = std::max(1, visibleCount);
-    const int panelHeight = 36 + rows * config.rowHeight + 8;
-    const int left = std::max(0, static_cast<int>(bounds.right) - config.offsetX - config.width);
-    const int top = config.offsetY;
-    RECT panel{left, top, left + config.width, top + panelHeight};
+    RECT panel = overlayPanelRect(bounds, config, clients.size());
+    const int left = panel.left;
+    const int top = panel.top;
+    const int panelHeight = panel.bottom - panel.top;
 
     HBRUSH panelBrush = CreateSolidBrush(RGB(18, 22, 28));
     FillRect(dc, &panel, panelBrush);
@@ -394,10 +496,26 @@ void paintOverlay(HWND window) {
     FillRect(dc, &accent, accentBrush);
     DeleteObject(accentBrush);
 
-    HFONT headerFont = CreateFontW(-config.fontSize, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HFONT headerFont = CreateFontW(-(g_moveMode ? std::min(config.fontSize, 17) : config.fontSize), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HFONT bodyFont = CreateFontW(-config.fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    RECT header{left + 16, top, panel.right - 12, top + 36};
-    drawTextLine(dc, L"GooseOverlay", header, RGB(229, 167, 43), headerFont, DT_LEFT | DT_END_ELLIPSIS);
+    RECT header = overlayHeaderRect(bounds, config);
+    if (config.clock.enabled && !g_moveMode) {
+        // Cap the header clock font so it fits even on the narrowest panel.
+        HFONT clockFont = CreateFontW(-std::min(config.fontSize, 20), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ previousFont = SelectObject(dc, clockFont);
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, L"00:00:00", 8, &extent);
+        SelectObject(dc, previousFont);
+        RECT clockRect = header;
+        clockRect.left = std::max(header.left, header.right - extent.cx - 4);
+        drawTextLine(dc, utc ? formatOverlayClock(config.clock, *utc) : currentOverlayClock(config.clock),
+            clockRect, RGB(190, 197, 207), clockFont, DT_RIGHT);
+        header.right = std::max(header.left, clockRect.left - 10);
+        DeleteObject(clockFont);
+    }
+    drawTextLine(dc, g_moveMode ? L"Тяните мышью" : L"GooseOverlay", header,
+        RGB(229, 167, 43), headerFont, DT_LEFT | DT_END_ELLIPSIS);
 
     if (clients.empty()) {
         RECT row{left + 16, top + 36, panel.right - 12, top + 36 + config.rowHeight};
@@ -425,26 +543,203 @@ void paintOverlay(HWND window) {
                 textRight -= 23;
             }
             RECT row{left + 36, y, textRight, y + config.rowHeight};
-            drawTextLine(dc, client.name, row, client.talking ? RGB(245, 247, 250) : RGB(190, 197, 207), bodyFont, DT_LEFT | DT_END_ELLIPSIS);
+            const std::wstring label = client.whisper ? L"[WHISPER] " + client.name : client.name;
+            drawTextLine(dc, label, row, client.whisper ? RGB(239, 190, 70) :
+                (client.talking ? RGB(245, 247, 250) : RGB(190, 197, 207)), bodyFont, DT_LEFT | DT_END_ELLIPSIS);
+        }
+    }
+
+    drawMoveHint(dc, panel, g_moveMode);
+
+    if (config.leaderEnabled && g_leaderPortrait) {
+        const auto leader = std::find_if(clients.begin(), clients.end(), [&](const ClientState& client) {
+            return client.talking && !client.muted && isLeaderName(client.name, config.leaderName);
+        });
+        if (leader != clients.end()) {
+            const auto rect = largeLeaderPortraitRect(bounds, config, clients.size());
+            if (rect.bottom > rect.top) g_leaderPortrait->draw(dc, rect.left, rect.top,
+                rect.right - rect.left, leader->talking && !leader->muted, tick);
         }
     }
 
     DeleteObject(headerFont);
     DeleteObject(bodyFont);
+}
+
+bool renderBufferedOverlay(PaintBuffer& buffer, HDC target, RECT bounds, RECT dirty, ULONGLONG tick, const SYSTEMTIME* utc = nullptr) {
+    if (!buffer.ensure(target, bounds.right, bounds.bottom)) return false;
+    // Nothing touches the visible window until the entire dirty region is ready.
+    // Compose with the same clip for full and partial updates: GDI+ image sampling
+    // can round differently when the memory DC clip changes between frames.
+    renderOverlay(buffer.dc(), bounds, tick, utc);
+    return buffer.present(target, dirty);
+}
+
+void paintOverlay(HWND window) {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(window, &paint);
+    RECT bounds{};
+    GetClientRect(window, &bounds);
+    if (g_paintBuffer) renderBufferedOverlay(*g_paintBuffer, dc, bounds, paint.rcPaint, GetTickCount64());
     EndPaint(window, &paint);
+}
+
+// Accessed only on the overlay thread; edit mode is never persisted.
+struct DragState {
+    bool active{};
+    POINT grab{};
+    int originalX{};
+    int originalY{};
+};
+DragState g_drag;
+
+void setMoveMode(HWND window, bool enabled) {
+    if (g_drag.active) {
+        g_drag.active = false;
+        {
+            std::lock_guard<std::mutex> lock(g_configMutex);
+            g_config.offsetX = g_drag.originalX;
+            g_config.offsetY = g_drag.originalY;
+        }
+        if (GetCapture() == window) ReleaseCapture();
+    }
+    g_moveMode = enabled;
+    const LONG_PTR style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    SetWindowLongPtrW(window, GWL_EXSTYLE, enabled ? style & ~WS_EX_TRANSPARENT : style | WS_EX_TRANSPARENT);
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    SetCursor(LoadCursorW(nullptr, enabled ? IDC_SIZEALL : IDC_ARROW));
+    InvalidateRect(window, nullptr, FALSE);
+    if (const HWND settings = g_settingsWindow.load()) PostMessageW(settings, kMoveStateChangedMessage, 0, 0);
+}
+
+void stopMoving() {
+    if (const HWND overlay = g_overlayWindow.load()) SendMessageW(overlay, kMoveModeMessage, 0, 0);
+}
+
+void toggleMoving() {
+    if (const HWND overlay = g_overlayWindow.load()) PostMessageW(overlay, kMoveModeMessage, 2, 0);
+}
+
+bool moveShortcutDown() {
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+        (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState('M') & 0x8000) &&
+        !(GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+        !(GetAsyncKeyState(VK_LWIN) & 0x8000) && !(GetAsyncKeyState(VK_RWIN) & 0x8000);
+}
+
+struct MoveShortcut {
+    bool wasDown{};
+    bool sample(bool down, bool available) {
+        const bool pressed = down && !wasDown;
+        wasDown = down;
+        return pressed && available;
+    }
+};
+
+void updateDragPosition(HWND window, POINT cursor) {
+    RECT bounds{};
+    GetClientRect(window, &bounds);
+    const auto count = displayClients().size();
+    {
+        std::lock_guard<std::mutex> lock(g_configMutex);
+        const auto panel = overlayPanelRect(bounds, g_config, count);
+        const int maxX = std::max(0L, bounds.right - (panel.right - panel.left));
+        const int maxY = std::max(0L, bounds.bottom - (panel.bottom - panel.top));
+        const int x = std::clamp(static_cast<int>(cursor.x - g_drag.grab.x), 0, maxX);
+        const int y = std::clamp(static_cast<int>(cursor.y - g_drag.grab.y), 0, maxY);
+        g_config.offsetX = std::min(32767, maxX - x);
+        g_config.offsetY = std::min(32767, y);
+    }
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+bool persistPosition(int x, int y) {
+    return WritePrivateProfileStringW(L"overlay", L"offset_x", std::to_wstring(x).c_str(), g_configPath.c_str()) &&
+        WritePrivateProfileStringW(L"overlay", L"offset_y", std::to_wstring(y).c_str(), g_configPath.c_str());
+}
+
+void finishDragging(HWND window) {
+    bool saved;
+    {
+        std::lock_guard<std::mutex> lock(g_configMutex);
+        saved = persistPosition(g_config.offsetX, g_config.offsetY);
+        if (!saved) {
+            persistPosition(g_drag.originalX, g_drag.originalY);
+            g_config.offsetX = g_drag.originalX;
+            g_config.offsetY = g_drag.originalY;
+        }
+    }
+    g_drag.active = false;
+    if (GetCapture() == window) ReleaseCapture();
+    setMoveMode(window, false);
+    if (const HWND settings = g_settingsWindow.load()) PostMessageW(settings, kPositionChangedMessage, 0, 0);
+    if (!saved) {
+        logMessage("Unable to save overlay position", LogLevel_ERROR);
+        printMessage("GooseOverlay: unable to save position; previous position restored.");
+    }
 }
 
 LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paintOverlay(window); return 0;
-        case WM_NCHITTEST: return HTTRANSPARENT;
+        case kMoveModeMessage:
+            setMoveMode(window, g_enabled && (wParam == 2 ? !g_moveMode.load() : wParam != 0));
+            return 0;
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_NCHITTEST: return g_moveMode ? HTCLIENT : HTTRANSPARENT;
+        case WM_SETCURSOR:
+            if (g_moveMode) { SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); return TRUE; }
+            break;
+        case WM_LBUTTONDOWN:
+            if (g_moveMode) {
+                const POINT cursor{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                RECT bounds{};
+                GetClientRect(window, &bounds);
+                const auto count = displayClients().size();
+                {
+                    std::lock_guard<std::mutex> lock(g_configMutex);
+                    const auto panel = overlayPanelRect(bounds, g_config, count);
+                    if (!PtInRect(&panel, cursor)) return 0;
+                    g_drag = {true, {cursor.x - panel.left, cursor.y - panel.top}, g_config.offsetX, g_config.offsetY};
+                }
+                SetCapture(window);
+                return 0;
+            }
+            break;
+        case WM_MOUSEMOVE:
+            if (g_drag.active) {
+                updateDragPosition(window, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+                return 0;
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (g_drag.active) {
+                updateDragPosition(window, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+                finishDragging(window);
+                return 0;
+            }
+            break;
+        case WM_RBUTTONDOWN:
+        case WM_CANCELMODE:
+            setMoveMode(window, false);
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (g_drag.active) setMoveMode(window, false);
+            return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
-        default: return DefWindowProcW(window, message, wParam, lParam);
+        default: break;
     }
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 void overlayMain() {
+    PaintBuffer paintBuffer;
+    g_paintBuffer = &paintBuffer;
+    LeaderPortrait portrait(g_module);
+    g_leaderPortrait = &portrait;
+    if (!portrait.ready()) logMessage("Unable to load leader portrait frames", LogLevel_WARNING);
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = g_module;
@@ -456,6 +751,8 @@ void overlayMain() {
     HWND overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         kOverlayClass, L"GooseOverlay", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_module, nullptr);
     if (!overlay) {
+        g_paintBuffer = nullptr;
+        g_leaderPortrait = nullptr;
         logMessage("Unable to create overlay window", LogLevel_ERROR);
         return;
     }
@@ -463,6 +760,10 @@ void overlayMain() {
 
     MSG message{};
     DWORD lastSearch{};
+    int appliedOpacity = -1;
+    ULONGLONG animationFrame = GetTickCount64() / 200;
+    std::wstring lastClockText;
+    MoveShortcut moveShortcut{moveShortcutDown()};
     while (!g_stop) {
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&message);
@@ -474,7 +775,10 @@ void overlayMain() {
             std::lock_guard<std::mutex> lock(g_configMutex);
             config = g_config;
         }
-        SetLayeredWindowAttributes(overlay, kTransparentColor, static_cast<BYTE>(config.opacity), LWA_COLORKEY | LWA_ALPHA);
+        if (appliedOpacity != config.opacity &&
+            SetLayeredWindowAttributes(overlay, kTransparentColor, static_cast<BYTE>(config.opacity), LWA_COLORKEY | LWA_ALPHA)) {
+            appliedOpacity = config.opacity;
+        }
 
         HWND game = g_gameWindow.load();
         const DWORD now = GetTickCount();
@@ -485,31 +789,94 @@ void overlayMain() {
         }
 
         bool shouldShow = g_enabled && IsWindow(game) && !IsIconic(game);
+        const bool gameFocused = GetAncestor(GetForegroundWindow(), GA_ROOT) == game;
+        if (moveShortcut.sample(moveShortcutDown(), shouldShow && gameFocused)) {
+            setMoveMode(overlay, !g_moveMode.load());
+        }
+        if (g_moveMode && (!g_enabled || (g_drag.active && (!shouldShow || !gameFocused)) ||
+            (gameFocused && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)))) {
+            setMoveMode(overlay, false);
+        }
         if (shouldShow && config.hideWhenUnfocused) {
-            shouldShow = GetAncestor(GetForegroundWindow(), GA_ROOT) == game;
+            shouldShow = gameFocused;
         }
         RECT gameRect{};
         if (shouldShow && getClientAreaOnScreen(game, gameRect)) {
-            SetWindowPos(overlay, HWND_TOPMOST, gameRect.left, gameRect.top,
-                gameRect.right - gameRect.left, gameRect.bottom - gameRect.top,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            InvalidateRect(overlay, nullptr, FALSE);
+            RECT currentRect{};
+            GetWindowRect(overlay, &currentRect);
+            if (!IsWindowVisible(overlay) || !EqualRect(&currentRect, &gameRect)) {
+                SetWindowPos(overlay, HWND_TOPMOST, gameRect.left, gameRect.top,
+                    gameRect.right - gameRect.left, gameRect.bottom - gameRect.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                InvalidateRect(overlay, nullptr, FALSE);
+            }
+            if (g_drag.active) {
+                // A non-activating window may miss mouse messages outside its
+                // visible area. Finish the drag even if button-up is missed.
+                POINT cursor{};
+                if (GetCursorPos(&cursor) && ScreenToClient(overlay, &cursor)) {
+                    updateDragPosition(overlay, cursor);
+                    if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) finishDragging(overlay);
+                } else setMoveMode(overlay, false);
+            }
+            const ULONGLONG frame = GetTickCount64() / 200;
+            const auto clockText = currentOverlayClock(config.clock);
+            if (clockText != lastClockText) {
+                RECT bounds{};
+                GetClientRect(overlay, &bounds);
+                const auto dirty = overlayHeaderRect(bounds, config);
+                InvalidateRect(overlay, &dirty, FALSE);
+                lastClockText = clockText;
+            }
+            if (frame != animationFrame && config.leaderEnabled && portrait.ready()) {
+                RECT bounds{};
+                GetClientRect(overlay, &bounds);
+                const auto clients = displayClients();
+                const int count = static_cast<int>(clients.size());
+                for (int i = 0; i < count; ++i) {
+                    const auto& client = clients[static_cast<size_t>(i)];
+                    if (client.talking && !client.muted && isLeaderName(client.name, config.leaderName)) {
+                        const auto dirty = largeLeaderPortraitRect(bounds, config, clients.size());
+                        if (dirty.bottom > dirty.top) InvalidateRect(overlay, &dirty, FALSE);
+                        break;
+                    }
+                }
+            }
+            animationFrame = frame;
         } else {
-            ShowWindow(overlay, SW_HIDE);
+            if (IsWindowVisible(overlay)) ShowWindow(overlay, SW_HIDE);
         }
-        Sleep(100);
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, (g_drag.active || (shouldShow && gameFocused)) ? 16 : 100, QS_ALLINPUT);
     }
+    setMoveMode(overlay, false);
     g_overlayWindow = nullptr;
     DestroyWindow(overlay);
     UnregisterClassW(kOverlayClass, g_module);
+    g_leaderPortrait = nullptr;
+    g_paintBuffer = nullptr;
 }
 
 void updateTalkState(uint64 server, anyID clientId, bool talking, bool whisper) {
     if (server != g_server.load()) return;
+    ClientState incoming;
+    if (talking && whisper) {
+        incoming.id = clientId;
+        incoming.talking = true;
+        incoming.whisper = true;
+        char name[512]{};
+        if (g_ts3.getClientDisplayName &&
+            g_ts3.getClientDisplayName(server, clientId, name, sizeof(name)) == ERROR_ok) {
+            incoming.name = utf8ToWide(name);
+        }
+        if (incoming.name.empty()) incoming.name = L"Client #" + std::to_wstring(clientId);
+    }
     bool found = false;
     {
         std::lock_guard<std::mutex> lock(g_modelMutex);
-        g_talkState[clientId] = {talking, whisper};
+        if (server != g_server.load()) return;
+        if (talking && whisper) g_whisperClients[clientId] = std::move(incoming);
+        else g_whisperClients.erase(clientId);
+        g_talkState[clientId] = {talking, talking && whisper};
         for (auto& client : g_clients) {
             if (client.id == clientId) {
                 client.talking = talking;
@@ -522,12 +889,12 @@ void updateTalkState(uint64 server, anyID clientId, bool talking, bool whisper) 
             return a.talking > b.talking;
         });
     }
-    if (!found) refreshClients(server);
+    if (!found && talking && !whisper) refreshClients(server);
     invalidateOverlay();
 }
 
 void refreshCurrentServer(uint64 server) {
-    g_server = server;
+    if (g_server.exchange(server) != server) clearClients();
     refreshClients(server);
 }
 
@@ -536,6 +903,11 @@ enum SettingsControlId {
     IDC_SETTINGS_HIDE_UNFOCUSED,
     IDC_SETTINGS_PROCESSES = 1010,
     IDC_SETTINGS_TITLE,
+    IDC_SETTINGS_LEADER_NAME,
+    IDC_SETTINGS_LEADER_ENABLED,
+    IDC_SETTINGS_LEADER_SIZE,
+    IDC_SETTINGS_CLOCK_ENABLED,
+    IDC_SETTINGS_CLOCK_ZONE,
     IDC_SETTINGS_OPACITY = 1020,
     IDC_SETTINGS_WIDTH,
     IDC_SETTINGS_OFFSET_X,
@@ -544,12 +916,15 @@ enum SettingsControlId {
     IDC_SETTINGS_FONT_SIZE,
     IDC_SETTINGS_MAX_CLIENTS,
     IDC_SETTINGS_APPLY = 1030,
+    IDC_SETTINGS_MOVE,
+    IDC_SETTINGS_RESET_POSITION,
 };
 
 struct SettingsState {
     Config config;
     bool enabled{};
     HFONT font{};
+    std::vector<DYNAMIC_TIME_ZONE_INFORMATION> clockZones;
 };
 
 void setControlFont(HWND control, HFONT font) {
@@ -600,8 +975,24 @@ bool readSettingsNumber(HWND window, int id, const wchar_t* label, int minValue,
 bool applySettings(HWND window) {
     auto* state = reinterpret_cast<SettingsState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (!state) return false;
+    stopMoving();
 
     Config next = state->config;
+    next.clock.enabled = SendDlgItemMessageW(window, IDC_SETTINGS_CLOCK_ENABLED, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const LRESULT zoneIndex = SendDlgItemMessageW(window, IDC_SETTINGS_CLOCK_ZONE, CB_GETCURSEL, 0, 0);
+    if (zoneIndex < 0 || static_cast<size_t>(zoneIndex) > state->clockZones.size()) return false;
+    next.clock.zoneId.clear();
+    next.clock.zone = {};
+    if (zoneIndex > 0) {
+        next.clock.zone = state->clockZones[static_cast<size_t>(zoneIndex - 1)];
+        next.clock.zoneId = next.clock.zone.TimeZoneKeyName;
+    }
+    next.leaderName = settingsControlText(window, IDC_SETTINGS_LEADER_NAME);
+    if (next.leaderName.empty() || next.leaderName.size() > 128) {
+        MessageBoxW(window, L"Укажите ник клан-лидера (от 1 до 128 символов).", L"GooseOverlay", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(window, IDC_SETTINGS_LEADER_NAME));
+        return false;
+    }
     next.processes = splitProcesses(settingsControlText(window, IDC_SETTINGS_PROCESSES));
     next.titleContains = lower(settingsControlText(window, IDC_SETTINGS_TITLE));
     if (next.processes.empty() && next.titleContains.empty()) {
@@ -610,10 +1001,12 @@ bool applySettings(HWND window) {
         return false;
     }
     next.hideWhenUnfocused = SendDlgItemMessageW(window, IDC_SETTINGS_HIDE_UNFOCUSED, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    next.leaderEnabled = SendDlgItemMessageW(window, IDC_SETTINGS_LEADER_ENABLED, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!readSettingsNumber(window, IDC_SETTINGS_LEADER_SIZE, L"Размер большого аватара", 64, 256, next.leaderSize)) return false;
     if (!readSettingsNumber(window, IDC_SETTINGS_OPACITY, L"Непрозрачность", 40, 255, next.opacity) ||
         !readSettingsNumber(window, IDC_SETTINGS_WIDTH, L"Ширина панели", 180, 800, next.width) ||
-        !readSettingsNumber(window, IDC_SETTINGS_OFFSET_X, L"Отступ справа", 0, 4000, next.offsetX) ||
-        !readSettingsNumber(window, IDC_SETTINGS_OFFSET_Y, L"Отступ сверху", 0, 4000, next.offsetY) ||
+        !readSettingsNumber(window, IDC_SETTINGS_OFFSET_X, L"Отступ справа", 0, 32767, next.offsetX) ||
+        !readSettingsNumber(window, IDC_SETTINGS_OFFSET_Y, L"Отступ сверху", 0, 32767, next.offsetY) ||
         !readSettingsNumber(window, IDC_SETTINGS_ROW_HEIGHT, L"Высота строки", 20, 80, next.rowHeight) ||
         !readSettingsNumber(window, IDC_SETTINGS_FONT_SIZE, L"Размер шрифта", 10, 44, next.fontSize) ||
         !readSettingsNumber(window, IDC_SETTINGS_MAX_CLIENTS, L"Максимум пользователей", 1, 64, next.maxClients)) {
@@ -621,7 +1014,10 @@ bool applySettings(HWND window) {
     }
 
     const bool enabled = SendDlgItemMessageW(window, IDC_SETTINGS_ENABLED, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    saveConfig(next, enabled);
+    if (!saveConfig(next, enabled)) {
+        MessageBoxW(window, L"Не удалось сохранить настройки. Проверьте доступ к файлу конфигурации TeamSpeak.", L"GooseOverlay", MB_OK | MB_ICONERROR);
+        return false;
+    }
     state->config = next;
     state->enabled = enabled;
     return true;
@@ -669,18 +1065,63 @@ LRESULT CALLBACK settingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
 
             createSettingsLabel(window, L"Максимум пользователей (1–64)", 18, 310, 230, font);
             createSettingsEdit(window, IDC_SETTINGS_MAX_CLIENTS, std::to_wstring(state->config.maxClients), 258, 306, 80, true, font);
-            createSettingsLabel(window, L"Положение задаётся относительно правого верхнего угла окна игры.", 18, 354, 584, font);
+            createSettingsControl(window, 0, L"BUTTON", g_moveMode ? L"Отменить перемещение" : L"Переместить мышью",
+                BS_PUSHBUTTON | WS_TABSTOP, 18, 345, 280, 30, IDC_SETTINGS_MOVE, font);
+            createSettingsControl(window, 0, L"BUTTON", L"Сбросить положение",
+                BS_PUSHBUTTON | WS_TABSTOP, 322, 345, 280, 30, IDC_SETTINGS_RESET_POSITION, font);
+
+            createSettingsLabel(window, L"Ник клан-лидера", 18, 393, 190, font);
+            createSettingsEdit(window, IDC_SETTINGS_LEADER_NAME, state->config.leaderName, 218, 389, 384, false, font);
+            SendDlgItemMessageW(window, IDC_SETTINGS_LEADER_NAME, EM_SETLIMITTEXT, 128, 0);
+            HWND avatarEnabled = createSettingsControl(window, 0, L"BUTTON", L"Показывать аватар под оверлеем во время речи лидера",
+                BS_AUTOCHECKBOX | WS_TABSTOP, 18, 424, 584, 24, IDC_SETTINGS_LEADER_ENABLED, font);
+            SendMessageW(avatarEnabled, BM_SETCHECK, state->config.leaderEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            createSettingsLabel(window, L"Размер большого аватара (64–256 px)", 18, 461, 300, font);
+            createSettingsEdit(window, IDC_SETTINGS_LEADER_SIZE, std::to_wstring(state->config.leaderSize), 330, 457, 80, true, font);
+
+            HWND clockEnabled = createSettingsControl(window, 0, L"BUTTON", L"Показывать время в заголовке (ЧЧ:ММ:СС)",
+                BS_AUTOCHECKBOX | WS_TABSTOP, 18, 493, 584, 24, IDC_SETTINGS_CLOCK_ENABLED, font);
+            SendMessageW(clockEnabled, BM_SETCHECK, state->config.clock.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            createSettingsLabel(window, L"Часовой пояс", 18, 533, 140, font);
+            HWND zones = createSettingsControl(window, 0, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                158, 529, 444, 250, IDC_SETTINGS_CLOCK_ZONE, font);
+            SendMessageW(zones, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Время компьютера"));
+            state->clockZones = clockTimeZones();
+            size_t selectedZone = 0;
+            for (size_t i = 0; i < state->clockZones.size(); ++i) {
+                const auto& zone = state->clockZones[i];
+                const auto label = clockZoneLabel(zone);
+                SendMessageW(zones, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                if (state->config.clock.zoneId == zone.TimeZoneKeyName) selectedZone = i + 1;
+            }
+            SendMessageW(zones, CB_SETCURSEL, selectedZone, 0);
+            createSettingsLabel(window, L"Сезонный перевод времени учитывается по правилам Windows.", 18, 567, 584, font);
 
             createSettingsControl(window, 0, L"BUTTON", L"Сохранить", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                310, 402, 92, 30, IDOK, font);
+                310, 610, 92, 30, IDOK, font);
             createSettingsControl(window, 0, L"BUTTON", L"Применить", BS_PUSHBUTTON | WS_TABSTOP,
-                410, 402, 92, 30, IDC_SETTINGS_APPLY, font);
+                410, 610, 92, 30, IDC_SETTINGS_APPLY, font);
             createSettingsControl(window, 0, L"BUTTON", L"Отмена", BS_PUSHBUTTON | WS_TABSTOP,
-                510, 402, 92, 30, IDCANCEL, font);
+                510, 610, 92, 30, IDCANCEL, font);
             return 0;
         }
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
+                case IDC_SETTINGS_MOVE:
+                    if (!g_enabled || !g_overlayWindow.load()) {
+                        MessageBoxW(window, L"Сначала включите оверлей и нажмите «Применить».", L"GooseOverlay", MB_OK | MB_ICONINFORMATION);
+                    } else toggleMoving();
+                    return 0;
+                case IDC_SETTINGS_RESET_POSITION: {
+                    stopMoving();
+                    // Discard a queued drag notification before editing the fields.
+                    MSG pending{};
+                    while (PeekMessageW(&pending, window, kPositionChangedMessage, kPositionChangedMessage, PM_REMOVE)) {}
+                    const Config defaults;
+                    SetDlgItemInt(window, IDC_SETTINGS_OFFSET_X, defaults.offsetX, FALSE);
+                    SetDlgItemInt(window, IDC_SETTINGS_OFFSET_Y, defaults.offsetY, FALSE);
+                    return 0;
+                }
                 case IDOK:
                     if (applySettings(window)) DestroyWindow(window);
                     return 0;
@@ -694,6 +1135,19 @@ LRESULT CALLBACK settingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
                     break;
             }
             break;
+        case kPositionChangedMessage: {
+            {
+                std::lock_guard<std::mutex> lock(g_configMutex);
+                state->config.offsetX = g_config.offsetX;
+                state->config.offsetY = g_config.offsetY;
+            }
+            SetDlgItemInt(window, IDC_SETTINGS_OFFSET_X, state->config.offsetX, FALSE);
+            SetDlgItemInt(window, IDC_SETTINGS_OFFSET_Y, state->config.offsetY, FALSE);
+            return 0;
+        }
+        case kMoveStateChangedMessage:
+            SetDlgItemTextW(window, IDC_SETTINGS_MOVE, g_moveMode ? L"Отменить перемещение" : L"Переместить мышью");
+            return 0;
         case WM_CLOSE:
             DestroyWindow(window);
             return 0;
@@ -732,7 +1186,7 @@ void showSettingsWindow(HWND owner) {
     state->enabled = g_enabled;
 
     constexpr int width = 638;
-    constexpr int height = 490;
+    constexpr int height = 698;
     RECT position{};
     if (!owner || !IsWindow(owner) || !GetWindowRect(owner, &position)) {
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &position, 0);
@@ -775,7 +1229,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 }
 
 TS3_EXPORT const char* ts3plugin_name() { return "GooseOverlay"; }
-TS3_EXPORT const char* ts3plugin_version() { return "0.5.0"; }
+TS3_EXPORT const char* ts3plugin_version() { return "0.13.0"; }
 TS3_EXPORT int ts3plugin_apiVersion() { return kPluginApiVersion; }
 TS3_EXPORT const char* ts3plugin_author() { return "GooseOverlay contributors"; }
 TS3_EXPORT const char* ts3plugin_description() { return "TeamSpeak speaking overlay for Battles for Glory (borderless/windowed mode)."; }
@@ -843,6 +1297,9 @@ TS3_EXPORT int ts3plugin_processCommand(uint64, const char* command) {
         g_enabled = false;
         persistEnabled();
         printMessage("GooseOverlay: disabled");
+    } else if (action == "move") {
+        toggleMoving();
+        printMessage("GooseOverlay: move mode toggled. Drag the panel in game; release to save. Escape or right click cancels.");
     } else if (action == "opacity") {
         int opacity{};
         if (input >> opacity) {
@@ -857,6 +1314,7 @@ TS3_EXPORT int ts3plugin_processCommand(uint64, const char* command) {
             printMessage("Usage: /goose opacity 40..255");
         }
     } else if (action == "reload") {
+        stopMoving();
         loadConfig();
         g_gameWindow = nullptr;
         invalidateOverlay();
@@ -865,23 +1323,28 @@ TS3_EXPORT int ts3plugin_processCommand(uint64, const char* command) {
         printMessage(std::string("GooseOverlay: ") + (g_enabled ? "enabled" : "disabled") +
             (IsWindow(g_gameWindow.load()) ? ", game detected" : ", waiting for game"));
     } else {
-        printMessage("GooseOverlay commands: /goose toggle | show | hide | opacity 40..255 | reload | status");
+        printMessage("GooseOverlay commands: /goose toggle | show | hide | move | opacity 40..255 | reload | status");
     }
     return 0;
 }
 
 TS3_EXPORT void ts3plugin_initHotkeys(PluginHotkey*** hotkeys) {
-    *hotkeys = static_cast<PluginHotkey**>(std::malloc(sizeof(PluginHotkey*) * 2));
+    *hotkeys = static_cast<PluginHotkey**>(std::malloc(sizeof(PluginHotkey*) * 3));
     (*hotkeys)[0] = static_cast<PluginHotkey*>(std::calloc(1, sizeof(PluginHotkey)));
     strcpy_s((*hotkeys)[0]->keyword, PLUGIN_HOTKEY_BUFSZ, "goose_overlay_toggle");
     strcpy_s((*hotkeys)[0]->description, PLUGIN_HOTKEY_BUFSZ, "Toggle GooseOverlay");
-    (*hotkeys)[1] = nullptr;
+    (*hotkeys)[1] = static_cast<PluginHotkey*>(std::calloc(1, sizeof(PluginHotkey)));
+    strcpy_s((*hotkeys)[1]->keyword, PLUGIN_HOTKEY_BUFSZ, "goose_overlay_move");
+    strcpy_s((*hotkeys)[1]->description, PLUGIN_HOTKEY_BUFSZ, "Move GooseOverlay with mouse");
+    (*hotkeys)[2] = nullptr;
 }
 
 TS3_EXPORT void ts3plugin_onHotkeyEvent(const char* keyword) {
     if (keyword && std::strcmp(keyword, "goose_overlay_toggle") == 0) {
         g_enabled = !g_enabled.load();
         persistEnabled();
+    } else if (keyword && std::strcmp(keyword, "goose_overlay_move") == 0 && !moveShortcutDown()) {
+        toggleMoving();
     }
 }
 
@@ -893,7 +1356,7 @@ TS3_EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 server, int status, 
 }
 
 TS3_EXPORT void ts3plugin_onTalkStatusChangeEvent(uint64 server, int status, int isWhisper, anyID clientId) {
-    updateTalkState(server, clientId, status != STATUS_NOT_TALKING, isWhisper != 0);
+    updateTalkState(server, clientId, status == STATUS_TALKING, isWhisper != 0);
 }
 
 TS3_EXPORT void ts3plugin_onUpdateClientEvent(uint64 server, anyID, anyID, const char*, const char*) {
